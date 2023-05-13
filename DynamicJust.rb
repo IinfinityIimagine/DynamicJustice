@@ -158,8 +158,6 @@ def selectTuning(args)
 end
 
 
-$active = Array.new(16, nil)
-$tuning = $limit7
 $lock = Mutex.new
 
 def complexity(frac, limit)
@@ -174,72 +172,57 @@ def complexity(frac, limit)
     return num.to_i * (1 + 1.0/limit) + den - 2
 end
 
-$consonance = $tuning.map { |f| complexity(f, 10**5) }
-$maxcons = $consonance.max+1
-$monophonic = $equal
-
 def basis(pitch)
     consonances = $active.map { |note|
         note ? $consonance[(pitch-note[1])%12] : $maxcons
     }
     ret = $active[consonances.rindex(consonances.min)]
     return ret if ret
-    return [440, 69, 69] if $monophonic != $equal
-    return [440.0 * 2 ** ((pitch - 69) / 12) * $monophonic[(pitch-69) % 12], pitch, pitch]
+    return [440, 69, 69, 0] if $monophonic != $equal
+    return [440.0 * 2 ** ((pitch - 69) / 12) * $monophonic[(pitch-69) % 12], pitch, pitch, 0]
 end
 
-def STDIN.getslot
-    $active.each_with_index { |note, channel|
-        return channel if not note
-    }
-    return nil
-end
-
-def tune!(pitch, slot)
-    freq, ref, _ = basis(pitch)
-    freq *= $tuning[(pitch-ref).round() % 12] * 2 ** ((pitch-ref).round() / 12)
+def tune(pitch)
+    freq, ref, _, num = basis(pitch)
+    freq *= $tuning[(pitch-ref).round() % 12] # * 2 ** ((pitch-ref).round() / 12)
     ref_key = 69 + (Math.log(freq/440.0, 2) * 12).round()
-    ref = 440.0 * 2 ** ((ref_key - 69).to_f / 12)
+    ref = 440.0 * 2 ** (((ref_key - 69).round() % 12).to_f / 12)
     adjust = (Math.log(freq/ref, 2) * 12 * 0x1000).round() + 0x2000
     throw "Error" if adjust >= 0x2800 or adjust <= 0x1800
     msb = adjust >> 7
     lsb = adjust & 0x7F
     puts "Just:#{freq}, 12TET:#{ref}, msb:#{msb}, lsb:#{lsb}"
-    return freq, msb, lsb, ref_key
+    return freq, msb, lsb, ref_key, num
 end
 
 def updateTuning!(command, pitch)
-    slot = STDIN.getslot
-    if not slot
-        timestamp = Time.now.to_f
-        puts "#{timestamp} : #{command} #{pitch} :- Polyphony Limit!"
-        return
-    end
-    freq, msb, lsb, ref = tune!(pitch, slot)
-    $active[slot] = [freq, pitch, ref]
+    slot = (pitch - 69).round() % 12
+    octave = (pitch - 69).round() - slot
+    freq, msb, lsb, ref, num = tune pitch
+    $active[slot] = [freq, pitch, ref, num + 1]
     $midout.send_channel_message(0xE0 | slot, lsb, msb)
-    return command & ~0xF | slot, ref
+    return command & ~0xF | slot, ref + octave
 end
 
 def find!(pitch)
     timestamp = Time.now.to_f
     puts "#{timestamp} : FINDING #{pitch}"
-    $active.each_with_index { |note, channel|
-        puts "FINDME: #{note.to_s} #{channel} #{pitch}"
-        if not note
-            next
-        elsif note[1] == pitch
-            puts "FOUND"
-            pitch = note[2]
-            $active[channel] = nil
-            return channel, pitch
-        end
-    }
-    throw "Error: Not found"
+    channel = (pitch - 69).round() % 12
+    octave = (pitch - 69).round() - channel
+    note = $active[channel]
+    throw "Error: Not found" if note[3] < 1
+    puts "FOUND"
+    pitch = note[2]
+    note[3] -= 1
+    puts "c:#{channel} p:#{pitch+octave}"
+    return channel, pitch + octave
 end
 
 begin
     $tuning, $monophonic = selectTuning ARGV
+    $active = $monophonic.each_with_index.map { |ratio, i|  [440 * ratio, 69 + i, 69 + i, 0]  }
+    $consonance = $tuning.map { |f| complexity(f, 10**5) }
+    $maxcons = $consonance.max+1
     $midin, $midout = selectPorts
     $midin.receive_channel_message { |command, pitch, velocity|
         timestamp = Time.now.to_f
