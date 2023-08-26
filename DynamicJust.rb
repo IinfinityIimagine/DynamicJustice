@@ -3,7 +3,7 @@
 require "rtmidi"
 require "time"
 
-def selectPorts()
+def selectPorts
     while true
         midin = RtMidi::In.new
         puts "Select Input Device"
@@ -157,9 +157,6 @@ def selectTuning(args)
     return tuning, monophonic
 end
 
-
-$lock = Mutex.new
-
 def complexity(frac, limit)
     raise "ratio out of range" if frac >=2 or frac < 1
     den = 1
@@ -172,58 +169,79 @@ def complexity(frac, limit)
     return num.to_i * (1 + 1.0/limit) + den - 2
 end
 
+def slot(pitch, ref = 69)
+    return (pitch - ref).round % 12
+end
+
+def octave(pitch, channel = slot(pitch))
+   return (pitch - 69).round - channel
+end
+
+def valid(note)
+    return note[3] > 0
+end
+
 def basis(pitch)
     consonances = $active.map { |note|
-        note ? $consonance[(pitch-note[1])%12] : $maxcons
+        (valid note) ? $consonance[slot(pitch, note[1])] : $maxcons
     }
-    ret = $active[consonances.rindex(consonances.min)]
-    return ret if ret
+    ratio = consonances.index(consonances.min)
+    ret = $active[ratio]
+    return ret if valid ret
     return [440, 69, 69, 0] if $monophonic != $equal
-    return [440.0 * 2 ** ((pitch - 69) / 12) * $monophonic[(pitch-69) % 12], pitch, pitch, 0]
+    channel = slot pitch
+    return [440.0 * $monophonic[channel], pitch, pitch, 0]
+end
+
+def pitch_bend(semitones, range)
+    throw "Error: Outisde Adjustment Range" if semitones < -0.5 or semitones > 0.5
+    adjust = (0x2000 * (1 + semitones / range)).to_i
+    throw "Error adjust=#{adjust}" if adjust < 0x0 or adjust > 0x3FFF
+    return adjust >> 7, adjust & 0x7F
 end
 
 def tune(pitch)
-    freq, ref, _, num = basis(pitch)
-    freq *= $tuning[(pitch-ref).round() % 12] # * 2 ** ((pitch-ref).round() / 12)
-    ref_key = 69 + (Math.log(freq/440.0, 2) * 12).round()
-    ref = 440.0 * 2 ** (((ref_key - 69).round() % 12).to_f / 12)
-    adjust = (Math.log(freq/ref, 2) * 12 * 0x1000).round() + 0x2000
-    throw "Error" if adjust >= 0x2800 or adjust <= 0x1800
-    msb = adjust >> 7
-    lsb = adjust & 0x7F
+    freq, ref, _, num = basis pitch
+    puts "Basis: #{freq}, #{ref}, #{_}, #{num}"
+    freq *= $tuning[slot(pitch, ref)]
+    freq /= 2 while freq >= 880
+    freq *= 2 while freq < 440
+    ref_key = 69 + (Math.log(freq/440.0, 2) * 12).round
+    ref = 440.0 * 2 ** ((slot(pitch).round % 12).to_f / 12)
+    adjust = Math.log(freq/ref, 2) * 12
+    puts "#{freq}, #{ref}, #{ref_key}, #{_}, #{num}, #{adjust}"
+    msb, lsb = pitch_bend(adjust, 2)
     puts "Just:#{freq}, 12TET:#{ref}, msb:#{msb}, lsb:#{lsb}"
     return freq, msb, lsb, ref_key, num
 end
 
 def updateTuning!(command, pitch)
-    slot = (pitch - 69).round() % 12
-    octave = (pitch - 69).round() - slot
     freq, msb, lsb, ref, num = tune pitch
-    $active[slot] = [freq, pitch, ref, num + 1]
-    $midout.send_channel_message(0xE0 | slot, lsb, msb)
-    return command & ~0xF | slot, ref + octave
+    channel = slot pitch
+    $active[channel] = [freq, 69 + channel, ref, num + 1]
+    $midout.send_channel_message(0xE0 | channel, lsb, msb)
+    return command & ~0xF | channel, ref + octave(pitch, channel)
 end
 
 def find!(pitch)
     timestamp = Time.now.to_f
     puts "#{timestamp} : FINDING #{pitch}"
-    channel = (pitch - 69).round() % 12
-    octave = (pitch - 69).round() - channel
+    channel = slot pitch
     note = $active[channel]
-    throw "Error: Not found" if note[3] < 1
-    puts "FOUND"
-    pitch = note[2]
+    throw "Error: Not found" if not valid note
+    pitch = note[2] + octave(pitch, channel)
     note[3] -= 1
-    puts "c:#{channel} p:#{pitch+octave}"
-    return channel, pitch + octave
+    puts "FOUND: c:#{channel} p:#{pitch}"
+    return channel, pitch
 end
 
 begin
     $tuning, $monophonic = selectTuning ARGV
     $active = $monophonic.each_with_index.map { |ratio, i|  [440 * ratio, 69 + i, 69 + i, 0]  }
     $consonance = $tuning.map { |f| complexity(f, 10**5) }
-    $maxcons = $consonance.max+1
+    $maxcons = $consonance.max + 1
     $midin, $midout = selectPorts
+    $lock = Mutex.new
     $midin.receive_channel_message { |command, pitch, velocity|
         timestamp = Time.now.to_f
         puts "#{timestamp} : #{command} #{pitch} #{velocity}"
@@ -242,7 +260,7 @@ begin
             rescue => e
                 puts e
             ensure
-                puts $active.to_s
+                # $active.each { |note| puts note.to_s }
             end
         }
     }
